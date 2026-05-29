@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "context-driven-llm-scheduler"
+version = "0.1.0"
+description = "Context-driven scheduled tasks for LLMs with persistent memory — inspired by OpenClaw's Heartbeat."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "CodifyIQ" }]
+keywords = ["cron", "scheduler", "heartbeat", "pulse", "context", "state"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: System :: Monitoring",
+]
+dependencies = ["portalocker>=2.8"]
+
+[project.optional-dependencies]
+sqlite = ["sqlalchemy>=2.0"]
+scheduler = ["apscheduler>=3.10"]
+litellm = ["litellm>=1.0"]
+dev = [
+    "behave>=1.2.6",
+    "ruff",
+    "sqlalchemy>=2.0",
+    "apscheduler>=3.10",
+    "litellm>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/codifyiq/context-driven-llm-scheduler"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/context_driven_llm_scheduler"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

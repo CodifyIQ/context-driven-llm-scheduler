@@ -1,0 +1,44 @@
+# Miscellaneous
+*.log
+*.swp
+.DS_Store
+.history
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+.vscode/
+
+# Python
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+#don't commit uv.lock for libraries:
+uv.lock
+.uv/
+
+# Test / coverage artifacts
+.coverage
+htmlcov/
+
+# Secrets and local env
+*.env
+!.env.example
+*-gcp-service-account-key.json
+
+# AI-assisted development tools
+.continue
+.claude/*.local.*
