@@ -34,6 +34,7 @@ from context_driven_llm_scheduler.core.types import (
     Context,
     PulseHandler,
 )
+from context_driven_llm_scheduler.result_log import ResultLog
 from context_driven_llm_scheduler.stores.file import FileStore
 from context_driven_llm_scheduler.util import (
     add_to_seen_set,
@@ -49,6 +50,7 @@ __all__ = [
     "PulseManager",
     "ContextStore",
     "FileStore",
+    "ResultLog",
     "SQLiteStore",
     "APSchedulerPulse",
     "Pulse",

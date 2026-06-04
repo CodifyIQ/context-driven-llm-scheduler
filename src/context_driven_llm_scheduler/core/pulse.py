@@ -54,22 +54,35 @@ class PulseDefinition:
     keep: dict[str, int] = field(default_factory=dict)
 
     @classmethod
-    def from_markdown(cls, text: str) -> "PulseDefinition":
-        """Parse a pulse definition from markdown-with-frontmatter text.
+    def from_markdown(
+        cls, text: str, *, default_id: str | None = None
+    ) -> "PulseDefinition":
+        """Parse a pulse definition from markdown text.
+
+        Frontmatter is optional. A file may be pure prose — its whole body is
+        the standing instruction — in which case ``default_id`` supplies the
+        id (the caller derives one, e.g. from the filename). Frontmatter is
+        only needed when a file wants to carry its own id or policy overrides.
 
         Args:
-            text: The full ``pulse.md`` contents.
+            text: The full markdown contents.
+            default_id: Fallback id used when the frontmatter has none, e.g.
+                the filename stem. :meth:`from_file` passes this automatically.
 
         Returns:
             The parsed definition.
 
         Raises:
-            ValueError: If the frontmatter is missing or has no ``id``.
+            ValueError: If no ``id`` is given in frontmatter and no
+                ``default_id`` is supplied.
         """
         meta, body = _split_frontmatter(text)
-        pulse_id = meta.get("id")
+        pulse_id = meta.get("id") or default_id
         if not pulse_id:
-            raise ValueError("pulse.md frontmatter must define an 'id'")
+            raise ValueError(
+                "pulse markdown has no 'id': add one to frontmatter or load "
+                "it from a file so the id can be derived from the filename"
+            )
 
         throttle_raw = meta.get("throttle", {})
         keep_raw = meta.get("keep", {})
@@ -90,7 +103,11 @@ class PulseDefinition:
 
     @classmethod
     def from_file(cls, path: str | PathLike[str]) -> "PulseDefinition":
-        """Parse a pulse definition from a ``pulse.md`` file on disk.
+        """Parse a pulse definition from a markdown file on disk.
+
+        The filename stem is used as the id when the file has no frontmatter
+        ``id``, so ``inbox-triage.md`` defines the pulse ``inbox-triage`` with
+        no frontmatter at all.
 
         Args:
             path: Path to the markdown file.
@@ -98,7 +115,10 @@ class PulseDefinition:
         Returns:
             The parsed definition.
         """
-        return cls.from_markdown(Path(path).read_text(encoding="utf-8"))
+        path = Path(path)
+        return cls.from_markdown(
+            path.read_text(encoding="utf-8"), default_id=path.stem
+        )
 
 
 class Pulse:
@@ -113,6 +133,9 @@ class Pulse:
         context: The mutable pulse context for this trigger.
         trigger_time: When this trigger fired (timezone-aware UTC).
         memory: Typed view over the structured memory in ``context``.
+        result: The run result recorded via :meth:`record_result`, or ``None``
+            if the handler recorded nothing. Read by the manager to render a
+            run-log entry.
     """
 
     def __init__(
@@ -132,6 +155,38 @@ class Pulse:
         self.context = context
         self.trigger_time = trigger_time
         self.memory = Memory(context.setdefault(_RESERVED_MEMORY_KEY, {}))
+        self.result: dict[str, Any] | None = None
+        # Snapshot what fed this run, before persist mutates memory, so a
+        # run-log entry can show the context the model actually saw.
+        self._carried_facts: dict[str, Any] = dict(self.memory.facts)
+        self._carried_notes: list[str] = list(self.memory.notes)
+
+    @property
+    def carried_facts(self) -> dict[str, Any]:
+        """Snapshot of ``memory.facts`` as it was at the start of the trigger."""
+        return self._carried_facts
+
+    @property
+    def carried_notes(self) -> list[str]:
+        """Snapshot of ``memory.notes`` as it was at the start of the trigger."""
+        return self._carried_notes
+
+    def record_result(self, body: str, **fields: Any) -> None:
+        """Record this run's result for the markdown run log.
+
+        Call this from the handler with the human-readable outcome (e.g. the
+        model's output) plus any structured detail worth logging. The manager
+        renders it, alongside the carried context and memory changes, into the
+        pulse's append-only ``ResultLog`` when one is configured. Recording a
+        result is independent of memory: a pulse can log a result, persist
+        memory ops, or both.
+
+        Args:
+            body: The result text to show under the entry's "Result" heading.
+            **fields: Optional scalar detail (e.g. ``tokens=2140``,
+                ``duration=1.8``) rendered as a bullet list in the entry.
+        """
+        self.result = {"body": body, **fields}
 
     def seconds_until_available(self, field_name: str) -> float:
         """Return seconds remaining before ``field_name`` may act again.
