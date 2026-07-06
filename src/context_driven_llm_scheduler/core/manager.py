@@ -25,6 +25,47 @@ from context_driven_llm_scheduler.util import utcnow
 if TYPE_CHECKING:
     from context_driven_llm_scheduler.result_log import ResultLog
 
+# Separator that joins a pulse id and an instance into one store key. Chosen so
+# that under a ``ResultLog`` (which replaces non-``[A-Za-z0-9._-]`` characters
+# with ``_``) a partitioned key renders as ``<id>__<instance>.md``.
+_INSTANCE_SEPARATOR = "::"
+
+
+def _store_key(pulse_id: str, instance: str | None) -> str:
+    """Compose the effective store key for a pulse id and optional instance.
+
+    Instance partitioning lets one pulse definition run across many isolated
+    state partitions. The manager owns the composition so callers address a
+    ``(pulse_id, instance)`` pair and never construct the composite key
+    themselves; the store, result log, and events see the composed key.
+
+    Args:
+        pulse_id: The pulse's registration id.
+        instance: The partition to isolate, or None for the unpartitioned key.
+
+    Returns:
+        ``pulse_id`` unchanged when ``instance`` is None (so the default path is
+        byte-for-byte identical to an unpartitioned pulse), otherwise
+        ``f"{pulse_id}{_INSTANCE_SEPARATOR}{instance}"``.
+
+    Raises:
+        ValueError: If a partitioned key would be ambiguous — either the
+            ``instance`` or the ``pulse_id`` contains the reserved separator, so
+            two distinct ``(pulse_id, instance)`` pairs could collapse onto one
+            key and silently share state. Rejected up front rather than parsed
+            into something subtly wrong. Unpartitioned keys are returned as-is
+            and never validated, keeping ``instance=None`` unchanged.
+    """
+    if instance is None:
+        return pulse_id
+    if _INSTANCE_SEPARATOR in pulse_id or _INSTANCE_SEPARATOR in instance:
+        raise ValueError(
+            f"pulse id and instance must not contain the reserved instance "
+            f"separator {_INSTANCE_SEPARATOR!r}, which would make the partition "
+            f"key ambiguous: pulse_id={pulse_id!r}, instance={instance!r}"
+        )
+    return f"{pulse_id}{_INSTANCE_SEPARATOR}{instance}"
+
 
 class PulseManager:
     """Registry of pulse handlers wired to a single context store.
@@ -158,6 +199,7 @@ class PulseManager:
         pulse_id: str,
         extra: dict | None = None,
         *,
+        instance: str | None = None,
         coalesce_window: float | None = None,
     ) -> Context:
         """Run one proactive cycle for ``pulse_id``.
@@ -175,10 +217,19 @@ class PulseManager:
         find the run too recent, and no-op. It needs no leader election or
         external coordination beyond the store the manager already owns.
 
+        With ``instance`` set, the same pulse id runs against an isolated state
+        partition: the effective store key becomes ``(pulse_id, instance)``, so
+        one definition can serve many independent subjects (tenants, teams,
+        accounts) without sharing memory. Coalescing is per-instance because
+        the window reads the partition's own context. ``instance=None`` is
+        byte-for-byte identical to the unpartitioned pulse.
+
         Args:
             pulse_id: The id of a registered pulse.
             extra: Optional per-trigger payload passed straight to the handler
                 (not persisted).
+            instance: Optional partition to isolate this run's state under, or
+                None for the unpartitioned pulse.
             coalesce_window: If set, skip when the previous run was within this
                 many seconds, returning the stored context unchanged.
 
@@ -188,21 +239,119 @@ class PulseManager:
 
         Raises:
             PulseNotRegisteredError: If no handler is registered for the id.
+            ValueError: If ``instance`` or ``pulse_id`` contains the reserved
+                partition separator ``"::"``.
             Exception: Whatever the handler raised, unless ``swallow_errors``.
         """
         if pulse_id not in self._pulse_handlers:
             raise PulseNotRegisteredError(
                 f"No handler registered for pulse '{pulse_id}'"
             )
+        return self._run_cycle(
+            pulse_id,
+            self._definitions.get(pulse_id),
+            self._pulse_handlers[pulse_id],
+            extra,
+            instance=instance,
+            coalesce_window=coalesce_window,
+        )
 
-        with self._store.transaction(pulse_id):
-            context = self._store.load(pulse_id) or {}
+    def trigger_definition(
+        self,
+        definition: PulseDefinition,
+        handler: PulseHandler,
+        extra: dict | None = None,
+        *,
+        instance: str | None = None,
+        coalesce_window: float | None = None,
+    ) -> Context:
+        """Run one proactive cycle for a definition built at call time.
+
+        Like :meth:`trigger`, but the definition and handler are supplied
+        directly instead of resolved from the registry, so a ``pulse.md`` body
+        sourced at runtime — a database row, remote config, an API response —
+        can run without :meth:`add_definition` / :meth:`pulse`. Nothing is
+        registered as a side effect; the call is self-contained.
+
+        The run is keyed by ``definition.id`` (plus ``instance``), so pairing
+        this with ``instance`` is the intended way to fan one runtime-sourced
+        definition across many isolated partitions.
+
+        Args:
+            definition: The pulse definition to run.
+            handler: The handler to invoke for this run.
+            extra: Optional per-trigger payload passed straight to the handler
+                (not persisted).
+            instance: Optional partition to isolate this run's state under, or
+                None for the unpartitioned pulse.
+            coalesce_window: If set, skip when the previous run was within this
+                many seconds, returning the stored context unchanged.
+
+        Returns:
+            The context as persisted after this trigger (or the unchanged
+            stored context when the trigger was coalesced away).
+
+        Raises:
+            ValueError: If ``instance`` or ``definition.id`` contains the
+                reserved partition separator ``"::"``.
+            Exception: Whatever the handler raised, unless ``swallow_errors``.
+        """
+        return self._run_cycle(
+            definition.id,
+            definition,
+            handler,
+            extra,
+            instance=instance,
+            coalesce_window=coalesce_window,
+        )
+
+    def _run_cycle(
+        self,
+        pulse_id: str,
+        definition: PulseDefinition | None,
+        handler: PulseHandler,
+        extra: dict | None,
+        *,
+        instance: str | None,
+        coalesce_window: float | None,
+    ) -> Context:
+        """Run the load → handler → persist → save cycle for one trigger.
+
+        Shared by :meth:`trigger` (registry-resolved) and
+        :meth:`trigger_definition` (call-time), keyed by the effective
+        ``(pulse_id, instance)`` store key.
+
+        Args:
+            pulse_id: The pulse's registration id, used for events and the
+                error log message.
+            definition: The definition to bind, or None if the id has a handler
+                but no loaded definition (surfaces as a run error, as before).
+            handler: The handler to invoke.
+            extra: The per-trigger payload passed to the handler.
+            instance: The partition to isolate under, or None.
+            coalesce_window: The de-duplication window, or None.
+
+        Returns:
+            The persisted context (or the unchanged stored context when
+            coalesced away).
+
+        Raises:
+            ValueError: If ``instance`` or ``pulse_id`` contains the reserved
+                partition separator ``"::"`` (raised before the transaction, so
+                it is never suppressed by ``swallow_errors``).
+            Exception: Whatever the handler raised, unless ``swallow_errors``.
+        """
+        store_key = _store_key(pulse_id, instance)
+
+        with self._store.transaction(store_key):
+            context = self._store.load(store_key) or {}
 
             trigger_time = utcnow()
             if self._is_too_soon(context, trigger_time, coalesce_window):
                 self._emit({
                     "event": "trigger_skipped",
                     "pulse_id": pulse_id,
+                    "instance": instance,
                     "at": trigger_time.isoformat(),
                     "reason": "coalesced",
                 })
@@ -213,12 +362,13 @@ class PulseManager:
             self._emit({
                 "event": "trigger_start",
                 "pulse_id": pulse_id,
+                "instance": instance,
                 "at": trigger_time.isoformat(),
             })
 
             try:
                 pulse, changes = self._run_pulse(
-                    pulse_id, context, trigger_time, extra
+                    pulse_id, definition, handler, context, trigger_time, extra
                 )
                 context = pulse.context
                 context[LAST_ERROR] = None
@@ -230,9 +380,9 @@ class PulseManager:
                 }
                 context[LAST_ERROR] = error
                 context[ERROR_COUNT] = context.get(ERROR_COUNT, 0) + 1
-                self._store.save(pulse_id, context)
+                self._store.save(store_key, context)
                 self._record_result(
-                    pulse_id, context, trigger_time, "error",
+                    store_key, definition, context, trigger_time, "error",
                     error=error,
                 )
                 if self._logger is not None:
@@ -242,20 +392,22 @@ class PulseManager:
                 self._emit({
                     "event": "trigger_error",
                     "pulse_id": pulse_id,
+                    "instance": instance,
                     "error": error,
                 })
                 if not self.swallow_errors:
                     raise
                 return context
 
-            self._store.save(pulse_id, context)
+            self._store.save(store_key, context)
             self._record_result(
-                pulse_id, context, trigger_time, "ok",
+                store_key, definition, context, trigger_time, "ok",
                 pulse=pulse, changes=changes,
             )
             self._emit({
                 "event": "trigger_end",
                 "pulse_id": pulse_id,
+                "instance": instance,
                 "at": trigger_time.isoformat(),
                 "trigger_count": context.get(TRIGGER_COUNT),
                 "changes": changes,
@@ -290,6 +442,8 @@ class PulseManager:
     def _run_pulse(
         self,
         pulse_id: str,
+        definition: PulseDefinition | None,
+        handler: PulseHandler,
         context: Context,
         trigger_time: datetime,
         extra: dict | None,
@@ -297,7 +451,9 @@ class PulseManager:
         """Run a markdown pulse: bind context, call handler, apply ops.
 
         Args:
-            pulse_id: The pulse id being triggered.
+            pulse_id: The pulse id being triggered, for the error message.
+            definition: The definition to bind, or None if none is available.
+            handler: The handler to invoke.
             context: The loaded context for this trigger.
             trigger_time: The trigger time.
             extra: The per-trigger payload passed to the handler.
@@ -309,21 +465,21 @@ class PulseManager:
             handler returned ``None``).
 
         Raises:
-            PulseNotRegisteredError: If no definition is loaded for the id.
+            PulseNotRegisteredError: If no definition is available for the id.
         """
-        definition = self._definitions.get(pulse_id)
         if definition is None:
             raise PulseNotRegisteredError(
                 f"No pulse definition loaded for '{pulse_id}'"
             )
         pulse = Pulse(definition, context, trigger_time)
-        ops = self._pulse_handlers[pulse_id](pulse, extra)
+        ops = handler(pulse, extra)
         changes = pulse.persist(ops) if ops is not None else []
         return pulse, changes
 
     def _record_result(
         self,
-        pulse_id: str,
+        log_key: str,
+        definition: PulseDefinition | None,
         context: Context,
         trigger_time: datetime,
         status: str,
@@ -341,7 +497,10 @@ class PulseManager:
         original exception is re-raised).
 
         Args:
-            pulse_id: The pulse id being triggered.
+            log_key: The effective store key, so a partitioned pulse gets its
+                own per-instance log file.
+            definition: The bound definition, read for the model string, or
+                None if none is available.
             context: The context after this trigger, read for the run number.
             trigger_time: The trigger time.
             status: ``"ok"`` or ``"error"``.
@@ -352,10 +511,9 @@ class PulseManager:
         """
         if self._result_log is None:
             return
-        definition = self._definitions.get(pulse_id)
         try:
             self._result_log.record(
-                pulse_id,
+                log_key,
                 trigger_time=trigger_time,
                 trigger_count=context.get(TRIGGER_COUNT),
                 status=status,
@@ -369,7 +527,7 @@ class PulseManager:
         except Exception as exc:  # the audit log must not break the pulse
             if self._logger is not None:
                 self._logger.warning(
-                    "Result log write failed for pulse '%s': %s", pulse_id, exc
+                    "Result log write failed for pulse '%s': %s", log_key, exc
                 )
 
     def _emit(self, event: dict[str, Any]) -> None:

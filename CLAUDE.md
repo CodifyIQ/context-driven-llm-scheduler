@@ -13,7 +13,8 @@ load context → recall/handler → persist ops → save.
 ## Layout
 - `src/context_driven_llm_scheduler/core/` — `types.py`, `exceptions.py`, `store.py` (ABC),
   `manager.py` (`PulseManager`, `from_dir`/`pulse()`, optional `on_event` +
-  `result_log`, `trigger(..., coalesce_window=)`),
+  `result_log`, `trigger(..., instance=, coalesce_window=)` +
+  `trigger_definition(def, handler, ...)` for ad-hoc, unregistered runs),
   `memory.py` (`Memory`, `apply_ops` → changeset, `MEMORY_OPS`,
   `MEMORY_TOOL_SCHEMA`),
   `pulse.py` (`PulseDefinition` w/ filename-id fallback, `Pulse` with
@@ -53,8 +54,18 @@ uv build
 ## Design invariants
 - Context is always plain JSON-serializable dict; datetimes stored as ISO strings.
 - `trigger()` wraps load→handler→persist→save in `store.transaction(key)` for
-  concurrency safety. `coalesce_window` rides that same transaction to collapse
-  a herd of near-simultaneous triggers (one scheduler per web worker) into one
+  concurrency safety. The manager owns the effective store key: `instance=`
+  composes `(pulse_id, instance)` into one partitioned key (`_store_key`,
+  separator `::`; it rejects a `pulse_id`/`instance` containing `::` so two
+  pairs can't silently collapse onto one key), so one definition runs across
+  isolated per-instance state while the store ABC
+  and backends stay unchanged (they see one opaque key). `instance=None` is
+  byte-for-byte the unpartitioned path; transaction, coalescing, and result-log
+  files (`<id>__<instance>.md`) are all per-instance. `trigger_definition()`
+  runs a call-time `PulseDefinition` + handler with no registration — pair it
+  with `instance=` to fan a runtime-sourced (DB/remote) body across tenants.
+  `coalesce_window` rides that same transaction to collapse a herd of
+  near-simultaneous triggers (one scheduler per web worker) into one
   run — no leader election. The APScheduler wrapper defaults it on, derived
   from the schedule's period, plus `max_instances=1`/`coalesce=True`.
 - The `ResultLog` is a human/audit artifact, kept strictly separate from the
