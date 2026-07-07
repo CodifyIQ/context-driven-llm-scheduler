@@ -44,7 +44,7 @@ from context_driven_llm_scheduler.util import (
     utcnow,
 )
 
-__version__ = "0.1.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "PulseManager",

@@ -96,6 +96,49 @@ The LLM outputs operations via tool calling:
 `throttle` — record action for rate limiting
 `set` / `forget` — key/value persistent facts
 
+### Multi-tenant pulses
+
+If your product runs the **same recurring task for many customers** — one
+readiness check per team, one digest per account, one monitor per project — two
+things usually get in the way:
+
+1. **Shared memory.** By default a task keeps a single memory. Run it for 50
+   teams and they all write to the same notebook, so one team's history
+   overwrites another's.
+2. **Fixed, file-based setup.** By default a task is defined in a file and
+   registered when the app starts. But in a real product each customer's rule
+   lives in *your database* and changes over time — you want to run the rule you
+   just fetched, right now.
+
+These two capabilities remove both walls:
+
+- **Per-customer isolation** — run one shared task separately for each customer,
+  each with its own private memory. You tell the library which customer a run is
+  for (`instance=`); it keeps them apart. One customer's run can never see or
+  overwrite another's history. Runs with no customer specified behave exactly as
+  before.
+- **Run a rule on the fly** — take a task description straight from your
+  database and run it immediately, with no need to register it ahead of time
+  (`trigger_definition(...)`).
+
+Put together: one rule, authored per customer and stored in your database, runs
+on its own schedule for each customer with fully separate memory.
+
+```python
+from context_driven_llm_scheduler import PulseDefinition
+
+# Each team's rule is a markdown doc stored in your database.
+# Build it at call time and run it for that team, with isolated memory.
+definition = PulseDefinition.from_markdown(rule_body, default_id="readiness-check")
+
+for team_id in active_teams:
+    manager.trigger_definition(definition, readiness_check, instance=team_id)
+```
+
+Every `team_id` shares the one `readiness-check` rule but keeps its own memory;
+the single `readiness_check` handler never has to deal with a team id itself.
+See `examples/multi_tenant_pulses.py`.
+
 ## Installation
 ```bash
 pip install context-driven-llm-scheduler
